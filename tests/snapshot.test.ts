@@ -3,7 +3,7 @@
  * before-backups grouped by anchor message seq, with real files under a
  * temporary directory — exactly the production restore path.
  */
-import { mkdtemp, mkdir, readdir, rm, writeFile, readFile, utimes, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -306,7 +306,7 @@ describe('restore planning reconciles with the current disk (Claude Code behavio
     expect(await readFile(file)).toEqual(Buffer.from([0xd6, 0xd0, 0xce, 0xc4]))
   })
 
-  it('treats a legacy lossy record that still matches the disk as unchanged', async () => {
+  it('reports a legacy lossy record, which has no recorded location, without changing the file', async () => {
     const file = await touch('gbk-same.txt', 'x')
     await writeFile(file, Buffer.from([0xd6, 0xd0])) // lossy decode: two U+FFFD
     await mkdir(store.anchorDir(session, 5), { recursive: true })
@@ -316,11 +316,10 @@ describe('restore planning reconciles with the current disk (Claude Code behavio
 
     expect(await store.impactsAfter(session, 5)).toEqual([])
     expect(await store.restoreAfter(session, 5, unlink))
-      .toEqual({ restored: [], deleted: [], skipped: [], failed: [] })
+      .toEqual({ restored: [], deleted: [], skipped: [file], failed: [] })
   })
 
-  it('restores a faithful legacy text record byte-exactly', async () => {
-    // A v1 string without U+FFFD is byte-exact UTF-8, so it restores normally.
+  it('refuses a faithful legacy text record, which has no recorded location', async () => {
     const file = await touch('text.txt', 'x')
     await writeFile(file, Buffer.from([0xd6, 0xd0]))
     await mkdir(store.anchorDir(session, 5), { recursive: true })
@@ -329,8 +328,9 @@ describe('restore planning reconciles with the current disk (Claude Code behavio
     }), 'utf8')
 
     const outcome = await store.restoreAfter(session, 5, unlink)
-    expect(outcome.restored).toEqual([file])
-    expect(await readFile(file, 'utf8')).toBe('text')
+    expect(outcome.restored).toEqual([])
+    expect(outcome.skipped).toEqual([file])
+    expect(await readFile(file)).toEqual(Buffer.from([0xd6, 0xd0]))
   })
 
   it('still deletes a created file whose current bytes are not valid UTF-8', async () => {
@@ -557,17 +557,17 @@ describe('reconcileTracked (user-message boundary re-check)', () => {
 })
 
 describe('content dedup (in-place link; old + new entry format)', () => {
-  it('reads pre-dedup (legacy, no `ref`) entries correctly: restore/impacts/tracked', async () => {
+  it('reads pre-dedup (legacy, no `ref`) entries as tracked, without restoring them', async () => {
     const file = await touch('a.txt', 'original')
     // Simulate an OLD-format entry written by a pre-dedup build (no `ref`).
     await mkdir(store.anchorDir(session, 5), { recursive: true })
     await writeFile(join(store.anchorDir(session, 5), 'legacy1.json'), JSON.stringify({ callId: 'legacy1', anchorSeq: 5, path: file, before: 'original', time: 1 }))
     await writeFile(file, 'changed', 'utf8')
     expect((await store.trackedPaths(session)).has(file)).toBe(true)
-    expect(await store.impactsAfter(session, 5)).toEqual([{ path: file, action: 'restore' }])
+    expect(await store.impactsAfter(session, 5)).toEqual([])
     const outcome = await store.restoreAfter(session, 5, unlink)
-    expect(outcome.restored).toEqual([file])
-    expect(await readFile(file, 'utf8')).toBe('original')
+    expect(outcome.skipped).toEqual([file])
+    expect(await readFile(file, 'utf8')).toBe('changed')
   })
 
   it('dedups a new identical write against a legacy real entry (new reads old)', async () => {

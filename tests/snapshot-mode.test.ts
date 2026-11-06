@@ -11,7 +11,7 @@
  * The tests skip themselves on a filesystem where chmod does not take effect
  * (e.g. a Windows mount), because there is no permission state to assert.
  */
-import { chmod, mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -139,13 +139,14 @@ describe('file mode on restore', () => {
 
   it('restores a READ-ONLY target with NO recorded mode and leaves its mode alone', async (ctx) => {
     // The R3 pre-step widens a read-only file to write it. With no recorded
-    // mode (a legacy entry), the live bits must be put back exactly.
+    // mode, the live bits must be put back exactly.
     const live = await touch('readonly-legacy.txt', 'A1', 0o644)
     if (!await chmodSupported(live)) return ctx.skip()
 
     await mkdir(store.anchorDir(session, 5), { recursive: true })
+    await writeFile(join(store.anchorDir(session, 5), 'legacy.before'), 'A0', 'utf8')
     await writeFile(join(store.anchorDir(session, 5), 'legacy.json'), JSON.stringify({
-      callId: 'legacy', anchorSeq: 5, path: live, before: 'A0', time: 1,
+      store: 2, callId: 'legacy', file: live, blob: 'legacy.before', size: 2, time: 1, parent: await realpath(dirname(live)),
     }), 'utf8')
     await chmod(live, 0o444)
 
@@ -155,13 +156,14 @@ describe('file mode on restore', () => {
     expect(await modeOf(live)).toBe(0o444)
   })
 
-  it('leaves the live mode alone for a legacy entry with no recorded mode', async (ctx) => {
+  it('leaves the live mode alone for an entry with no recorded mode', async (ctx) => {
     const live = await touch('legacy-mode.txt', 'A1', 0o644)
     if (!await chmodSupported(live)) return ctx.skip()
 
     await mkdir(store.anchorDir(session, 5), { recursive: true })
+    await writeFile(join(store.anchorDir(session, 5), 'legacy.before'), 'A0', 'utf8')
     await writeFile(join(store.anchorDir(session, 5), 'legacy.json'), JSON.stringify({
-      callId: 'legacy', anchorSeq: 5, path: live, before: 'A0', time: 1,
+      store: 2, callId: 'legacy', file: live, blob: 'legacy.before', size: 2, time: 1, parent: await realpath(dirname(live)),
     }), 'utf8')
     await chmod(live, 0o600)
 

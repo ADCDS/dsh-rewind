@@ -19,9 +19,9 @@
  *    per-commit prune pass that enforces the 100-anchor-group cap, while
  *    crashed (running) and corrupt journals are never destroyed.
  */
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SnapshotStore, type CrashPoint, type DiskProbe, type RestoreJournal, type RestoreRunOptions } from '../src/snapshot.ts'
 
@@ -452,7 +452,7 @@ describe('reconciliation auto-heal and failure reporting', () => {
       targetSeq: 5,
       startedAt: 1,
       state: 'running',
-      actions: [{ path: file, action: 'restore', before: 'v1-before', rescue: 'v1-after', done: false }],
+      actions: [{ path: file, action: 'restore', before: 'v1-before', rescue: 'v1-after', done: false, parent: await realpath(dirname(file)) }],
     }), 'utf8')
 
     const reports = await store.reconcileRestores(session)
@@ -483,7 +483,7 @@ describe('reconciliation auto-heal and failure reporting', () => {
       targetSeq: 5,
       startedAt: 1,
       state: 'running',
-      actions: [{ path: file, action: 'restore', before: 'target', rescue: 'pre-restore', done: true }],
+      actions: [{ path: file, action: 'restore', before: 'target', rescue: 'pre-restore', done: true, parent: await realpath(dirname(file)) }],
     }), 'utf8')
     await writeFile(file, 'target', 'utf8') // the restore had already landed
 

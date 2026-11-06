@@ -9,7 +9,7 @@
  * images, NUL bytes, CRLF, empty files and large files — plus the integrity
  * rules that must hold when a sidecar is missing or a dedup handle goes stale.
  */
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -205,7 +205,7 @@ describe('integrity rules', () => {
     // An entry written before the digest was added: same schema, older name.
     await mkdir(store.anchorDir(session, 5), { recursive: true })
     await writeFile(join(store.anchorDir(session, 5), 'legacyname.json'), JSON.stringify({
-      store: 2, callId: 'old', file: a, blob: 'legacyname.before', size: 1, time: 1,
+      store: 2, callId: 'old', file: a, blob: 'legacyname.before', size: 1, time: 1, parent: await realpath(dirname(a)),
     }), 'utf8')
     await writeFile(join(store.anchorDir(session, 5), 'legacyname.before'), Buffer.from('A'))
     await captureAndRecord('new', 5, b)
@@ -363,7 +363,7 @@ describe('integrity rules', () => {
     // …and a v2 link that points at it (the upgrade-in-the-middle chain).
     await mkdir(store.anchorDir(session, 6), { recursive: true })
     await writeFile(join(store.anchorDir(session, 6), 'c2.json'), JSON.stringify({
-      store: 2, callId: 'c2', file: live, ref: '5/c1.json', time: 2,
+      store: 2, callId: 'c2', file: live, ref: '5/c1.json', time: 2, parent: await realpath(dirname(live)),
     }), 'utf8')
 
     await writeFile(live, Buffer.from('changed'))

@@ -10,6 +10,22 @@ and the release steps are documented in
 
 > 适配 DSH `>=0.2.2-rc.1 <0.3.0-0`
 
+### 问题修复
+
+- 还原不再能离开记录的目录：模型在工作区内删除、重建或替换目录、符号链接、硬链接或 FIFO，都不能让还原写入、删除或修改工作区外的文件。
+- 没有记录目录位置的快照会被跳过并报告，而不是按当前路径还原。
+- 无法映射到本机路径的文件系统后端（如远程后端）不再被捕获，避免删除本机同名文件。
+
+---
+
+> DSH `>=0.2.2-rc.1 <0.3.0-0` supported.
+
+### Bug Fixes
+
+- A restore can no longer leave its recorded directory: a model deleting, recreating or swapping a directory, symlink, hard link or FIFO inside the workspace cannot make a restore write, delete or chmod a file outside it.
+- A snapshot with no recorded location is skipped and reported instead of restored through whatever the path resolves to now.
+- A filesystem backend that cannot name a path on the host, such as a remote one, is no longer captured, so a rewind cannot delete a same-named host file.
+
 **Full Changelog**: https://github.com/SiriLee/dsh-rewind/compare/v0.21.0...vNEXT
 
 ## [0.21.0] - 2026-11-05

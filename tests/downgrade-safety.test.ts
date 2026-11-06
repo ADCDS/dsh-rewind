@@ -18,7 +18,7 @@
  * (`src/snapshot.ts` at 0bfa087). If a future change renames `file` back to
  * `path` (or adds `anchorSeq`), this test fails — the contract is permanent.
  */
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -188,7 +188,7 @@ describe('a store written by a NEWER build is never touched', () => {
 })
 
 describe('v1 entries and v2 entries compose in one window', () => {
-  it('reads a legacy entry next to a byte entry and restores both', async () => {
+  it('reads a legacy entry next to a byte entry, restoring only the one with a location', async () => {
     const legacyPath = join(root, 'ws', 'legacy.txt')
     const bytePath = join(root, 'ws', 'byte.bin')
     await mkdir(join(root, 'ws'), { recursive: true })
@@ -207,8 +207,9 @@ describe('v1 entries and v2 entries compose in one window', () => {
     await writeFile(legacyPath, Buffer.from('changed'))
     await writeFile(bytePath, Buffer.from('changed'))
     const outcome = await store.restoreAfter(session, 5, unlink)
-    expect([...outcome.restored].sort()).toEqual([bytePath, legacyPath])
-    expect(await readFile(legacyPath, 'utf8')).toBe('v1-content')
+    expect(outcome.restored).toEqual([bytePath])
+    expect(outcome.skipped).toEqual([legacyPath])
+    expect(await readFile(legacyPath, 'utf8')).toBe('changed')
     expect(await readFile(bytePath, 'utf8')).toBe('old')
   })
 })
