@@ -96,6 +96,7 @@ class FakeFs extends FileSystem {
     return { targetKey: FsTargetKey(displayPath), displayPath }
   }
   processPath(target) { return target.displayPath }
+  processPathFromHostPath(hostPath) { return hostPath }
   async readText(target) { return readFile(target.displayPath, 'utf8') }
   async writeText(target, content) { await writeFile(target.displayPath, content, 'utf8'); return { operation: 'update', version: FsVersion('v'), before: null, after: content } }
   async stat(target) {

@@ -38,8 +38,8 @@
  */
 
 import { createHash } from 'node:crypto'
-import type { Stats } from 'node:fs'
-import { chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { constants, type Stats } from 'node:fs'
+import { copyFile, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile, type FileHandle } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 
@@ -476,7 +476,7 @@ export const defaultProbe: DiskProbe = {
   },
   async copy(path: string, dest: string): Promise<CopyOutcome> {
     try {
-      await copyFile(path, dest)
+      await copyNoFollow(path, dest)
       const st = await stat(dest)
       return { kind: 'copied', size: st.size }
     } catch (error) {
@@ -762,8 +762,8 @@ async function readEntry(file: string, anchorSeq: number): Promise<StoredEntry |
   const origin = { file }
   if (parsed.store === 2) {
     if (typeof parsed.file !== 'string') return undefined
-    // Optional metadata: a malformed pin is ignored (the path falls back to the
-    // final-component check), never treated as corruption.
+    // Optional metadata: a malformed pin leaves the entry with no location, which
+    // a restore refuses, and is never treated as corruption.
     const parent = typeof parsed.parent === 'string' && parsed.parent.length > 0 ? parsed.parent : undefined
     const base = { callId, anchorSeq, path: parsed.file, time, ...(parent !== undefined ? { parent } : {}), ...origin }
     if (typeof parsed.ref === 'string') return { ...base, ref: parsed.ref }
@@ -863,6 +863,157 @@ async function nearestExistingAncestor(dir: string): Promise<string | undefined>
 }
 
 /**
+ * The canonical directory `path` lives in, for an entry's location pin. A parent
+ * chain that does not exist yet (or any more) pins where it WOULD resolve: the
+ * `realpath` of its nearest surviving ancestor plus the missing segments, so a
+ * link created there later cannot pass as the same location. Undefined when
+ * nothing can be resolved; such an entry is never restored.
+ */
+export async function locationPin(path: string): Promise<string | undefined> {
+  const dir = dirname(path)
+  try {
+    return await realpath(dir)
+  } catch (error) {
+    if (!isEnoent(error)) return undefined
+  }
+  const ancestor = await nearestExistingAncestor(dir)
+  if (ancestor === undefined) return undefined
+  try {
+    return join(await realpath(ancestor), relative(ancestor, dir))
+  } catch {
+    return undefined
+  }
+}
+
+/** A path component changed between the location check and the operation on it. */
+class LocationChangedError extends Error {}
+
+/** True when a restore must report the path as moved rather than as an IO failure. */
+function isLocationChange(error: unknown): boolean {
+  if (error instanceof LocationChangedError) return true
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  // ELOOP and EMLINK are O_NOFOLLOW meeting a symlink; ENOTDIR is a component
+  // that stopped being a directory.
+  return code === 'ELOOP' || code === 'EMLINK' || code === 'ENOTDIR'
+}
+
+const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0
+const O_NONBLOCK = constants.O_NONBLOCK ?? 0
+const O_DIRECTORY = constants.O_DIRECTORY ?? 0
+
+/**
+ * Run `use` with a path that addresses the pinned directory itself.
+ *
+ * On Linux the path goes through a held descriptor whose real location was just
+ * read back from the kernel, so swapping any component of `pin` afterwards cannot
+ * redirect the operation. Node has no `openat`, and other platforms have no
+ * equivalent directory path, so there the location is re-checked immediately
+ * before `use` and a swap in that gap is not excluded.
+ *
+ * @param pin - canonical directory (a {@link locationPin} value).
+ * @param use - receives the path to operate through.
+ * @returns what `use` returned.
+ * @throws LocationChangedError when the directory is no longer at `pin`.
+ */
+export async function withPinnedDir<T>(pin: string, use: (dir: string) => Promise<T>): Promise<T> {
+  const recheck = async (): Promise<T> => {
+    if (await realpath(pin) !== pin) throw new LocationChangedError(`no longer at ${pin}`)
+    return use(pin)
+  }
+  if (process.platform !== 'linux') return recheck()
+  const handle = await open(pin, constants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+  try {
+    const descriptor = `/proc/self/fd/${handle.fd}`
+    const actual = await readlink(descriptor).catch((error: unknown) => {
+      if (isEnoent(error)) return undefined // no /proc mounted
+      throw error
+    })
+    if (actual === undefined) return await recheck()
+    if (actual !== pin) throw new LocationChangedError(`no longer at ${pin}`)
+    return await use(descriptor)
+  } finally {
+    await handle.close()
+  }
+}
+
+/**
+ * Copy a regular file without following a final symlink, so a link swapped in
+ * after a check cannot pull an outside file into the store.
+ *
+ * @param path - file to read.
+ * @param dest - file to write.
+ * @throws when `path` is a symlink or not a regular file.
+ */
+export async function copyNoFollow(path: string, dest: string): Promise<void> {
+  const source = await open(path, constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+  try {
+    if (!(await source.stat()).isFile()) throw new Error(`not a regular file: ${path}`)
+    await writeFile(dest, source.createReadStream({ autoClose: false }))
+  } finally {
+    await source.close()
+  }
+}
+
+/**
+ * Write restored bytes to `target` in place, keeping its inode and thus its
+ * xattrs and ACLs. Every open refuses a final symlink and every mode change goes
+ * through a descriptor, so a link swapped in cannot redirect the write or the
+ * chmod. A target that stopped being one regular file is left alone.
+ */
+async function writeRestored(target: string, bytes: Uint8Array, mode: number | undefined): Promise<'restored' | 'skipped'> {
+  const applyMode = async (handle: FileHandle, value: number | undefined): Promise<void> => {
+    // Best-effort (ADR-9/R3): a refused chmod never fails a restore whose bytes landed.
+    if (value !== undefined) await handle.chmod(value).catch(() => undefined)
+  }
+  let existing: FileHandle | undefined
+  try {
+    existing = await open(target, constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+  } catch (error) {
+    if (!isEnoent(error)) throw error
+  }
+  if (existing === undefined) {
+    const created = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW, 0o666)
+    try {
+      await created.writeFile(bytes)
+      await applyMode(created, mode)
+    } finally {
+      await created.close()
+    }
+    return 'restored'
+  }
+  try {
+    const before = await existing.stat()
+    if (!before.isFile() || before.nlink > 1) return 'skipped'
+    const original = before.mode & 0o7777
+    // A read-only target cannot be opened for writing: add owner-write for the
+    // attempt and take it back afterwards (R3).
+    const widened = (original & 0o200) === 0
+    if (widened) await applyMode(existing, original | 0o200)
+    let wrote = false
+    try {
+      const writer = await open(target, constants.O_WRONLY | O_NOFOLLOW | O_NONBLOCK)
+      try {
+        const current = await writer.stat()
+        if (current.ino !== before.ino || current.dev !== before.dev) return 'skipped'
+        await writer.truncate(0)
+        await writer.writeFile(bytes)
+        wrote = true
+      } finally {
+        await writer.close()
+      }
+    } finally {
+      // No recorded mode (a legacy entry, or a link materialized without one):
+      // the live bits are not ours to change, so only undo the widening.
+      if (wrote && mode !== undefined) await applyMode(existing, mode)
+      else if (widened) await applyMode(existing, original)
+    }
+    return 'restored'
+  } finally {
+    await existing.close()
+  }
+}
+
+/**
  * True when `path`'s parent directory still resolves where it did at checkpoint
  * time (`recorded`, the entry's location pin). Only the path's FINAL component
  * is link-checked (see {@link isLinkPath}); without this a repointed ancestor
@@ -870,7 +1021,7 @@ async function nearestExistingAncestor(dir: string): Promise<string | undefined>
  * recorded location.
  *
  * - no pin (a legacy entry, or a commit that could not resolve its parent) →
- *   true: the released behavior is preserved;
+ *   false: a location that was never recorded cannot be verified;
  * - the parent resolves to the pinned location → true. A STABLE symlinked
  *   ancestor resolves identically on both sides (the pin is a `realpath`), so
  *   a symlinked workspace root is never a false skip;
@@ -882,7 +1033,7 @@ async function nearestExistingAncestor(dir: string): Promise<string | undefined>
  *   refuse rather than write into a location that cannot be verified.
  */
 async function parentStillMatches(path: string, recorded: string | undefined): Promise<boolean> {
-  if (recorded === undefined) return true
+  if (recorded === undefined) return false
   const dir = dirname(path)
   try {
     return await realpath(dir) === recorded
@@ -1083,7 +1234,7 @@ export class SnapshotStore {
    * restart. A handle whose bytes vanished (pruned out of band) is treated as
    * "never recorded" — dedup then stores MORE, never less.
    */
-  private readonly lastEntry = new Map<string, { source: ByteSource | null; ref: string }>()
+  private readonly lastEntry = new Map<string, { source: ByteSource | null; ref: string; parent?: string }>()
 
   /** Sessions whose dedup state has been seeded from disk this process. */
   private readonly seededSessions = new Set<string>()
@@ -1222,7 +1373,11 @@ export class SnapshotStore {
         const key = `${sessionId}\0${entry.path}`
         if (this.lastEntry.has(key)) continue
         const source = await this.resolveBefore(sessionId, entry)
-        this.lastEntry.set(key, { source, ref: this.refOfRead(sessionId, entry) })
+        this.lastEntry.set(key, {
+          source,
+          ref: this.refOfRead(sessionId, entry),
+          ...(entry.parent !== undefined ? { parent: entry.parent } : {}),
+        })
       }
     } catch {
       // Seeding is best-effort: an unreadable/corrupt session simply starts
@@ -1336,16 +1491,16 @@ export class SnapshotStore {
       readonly staged?: { readonly file: string }
       readonly mode?: number
     },
-    opts?: { readonly dedup?: boolean; readonly crash?: (point: CrashPoint) => void },
+    opts?: { readonly dedup?: boolean; readonly parent?: string; readonly crash?: (point: CrashPoint) => void },
   ): Promise<void> {
     // Monotonic time (see lastEntryTime): strictly increasing per store
     // instance, so same-millisecond commits stay capture-ordered.
     const time = Math.max(Date.now(), this.lastEntryTime + 1)
     this.lastEntryTime = time
-    // The location pin: where this path's directory resolved at commit time.
-    // Best-effort — an unresolvable parent simply means "no pin" (legacy
-    // behavior), never a failed commit.
-    const parent = await realpath(dirname(entry.path)).catch(() => undefined)
+    // The location pin: where this path's directory resolved when it was
+    // captured, or now when the caller took no earlier reading. An unresolvable
+    // parent means "no pin", which a restore refuses, never a failed commit.
+    const parent = opts?.parent ?? await locationPin(entry.path)
     await this.ensureDedupSeeded(sessionId)
     // Never write into a store a newer build owns: the marker would be
     // overwritten and the formats mixed. The failure is loud (the host logs
@@ -1381,7 +1536,7 @@ export class SnapshotStore {
       // (a crash in between leaves an inert orphan, never a lost backup).
       if (content.staged !== undefined) await rm(content.staged.file, { force: true })
       await writeJsonAtomic(file, linkToJson(committed), () => opts?.crash?.('after-temp-write'))
-      this.lastEntry.set(key, { source: prior.source, ref: selfRef })
+      this.lastEntry.set(key, { source: prior.source, ref: selfRef, ...(parent !== undefined ? { parent } : {}) })
     } else {
       const placed = await this.placeSidecar(file, content)
       const committed: CheckpointEntry = {
@@ -1399,7 +1554,7 @@ export class SnapshotStore {
         time,
       }
       await writeJsonAtomic(file, entryToJson(committed), () => opts?.crash?.('after-temp-write'))
-      this.lastEntry.set(key, { source: committed.before, ref: selfRef })
+      this.lastEntry.set(key, { source: committed.before, ref: selfRef, ...(parent !== undefined ? { parent } : {}) })
     }
     // Stamp the session-format marker so this session's snapshots record the
     // session-format version they were written under — the value the
@@ -1455,7 +1610,7 @@ export class SnapshotStore {
     sessionId: string,
     entry: { readonly callId: string; readonly anchorSeq: number; readonly path: string },
     backup: PendingBackup | null,
-    opts?: { readonly dedup?: boolean; readonly crash?: (point: CrashPoint) => void },
+    opts?: { readonly dedup?: boolean; readonly parent?: string; readonly crash?: (point: CrashPoint) => void },
   ): Promise<void> {
     await this.commit(sessionId, entry, {
       source: backup === null ? null : { kind: 'blob', path: backup.file },
@@ -1475,6 +1630,21 @@ export class SnapshotStore {
   async lastKnownContent(sessionId: string, path: string): Promise<ByteSource | null | undefined> {
     await this.ensureDedupSeeded(sessionId)
     return this.lastEntry.get(`${sessionId}\0${path}`)?.source
+  }
+
+  /**
+   * The location pin of the path's MOST RECENT entry, or undefined when the path
+   * has no pinned record. Read from disk when dedup state does not hold the path,
+   * because this decides containment and must not depend on the dedup setting.
+   */
+  async lastKnownParent(sessionId: string, path: string): Promise<string | undefined> {
+    await this.ensureDedupSeeded(sessionId)
+    const known = this.lastEntry.get(`${sessionId}\0${path}`)
+    if (known !== undefined) return known.parent
+    for (const entry of await this.entriesAfter(sessionId, 0)) {
+      if (entry.path === path) return entry.parent
+    }
+    return undefined
   }
 
   /**
@@ -1709,7 +1879,7 @@ export class SnapshotStore {
         if (applied === 'skipped') {
           // The directory moved between planning and this write: refuse, and
           // record why so the journal cannot claim the op completed.
-          journalAction.failed = `parent directory moved or repointed: ${dirname(action.path)}`
+          journalAction.failed = `path moved or repointed: ${action.path}`
           await this.saveJournal(journal)
           failed.push({ path: action.path, message: journalAction.failed })
           continue
@@ -1927,15 +2097,16 @@ export class SnapshotStore {
   /**
    * Execute ONE fs mutation with exactly the pre-journal semantics: a delete
    * runs through the injected deleteFile (ENOENT tolerated — the file is
-   * already absent, i.e. the target state is reached), a restore copies the
+   * already absent, i.e. the target state is reached), a restore writes the
    * recorded bytes back over the file (creating the parent if needed).
    *
-   * This is the only place the store writes restored content to the real FS,
-   * and it is deliberately raw `copyFile`/`writeFile`/`unlink` rather than the
-   * fs service: the caller only ever hands it a path from `planRestore` — one
-   * the session's own write-class tool call recorded and resolved (never a
-   * symlink/hard link) and only when it differs from the live disk. So no
-   * arbitrary path, no model input, never automatic.
+   * This is the only place the store changes the real FS, and it runs in the
+   * Host, outside the sandbox that confined the model that may have arranged
+   * the paths it meets. Every mutation therefore goes through
+   * {@link withPinnedDir}: a `skipped` result means a path component no longer
+   * matches the entry's recorded location or the target is no longer one regular
+   * file, and nothing was changed there. On a race, `mkdir` can still create
+   * empty directories under a repointed ancestor before the location is verified.
    *
    * The write is IN PLACE (no temp + rename): it keeps the file's inode and
    * thus its xattrs/ACL, and crash safety is provided by the journal plus disk
@@ -1953,47 +2124,29 @@ export class SnapshotStore {
     deleteFile: DeleteFile,
     opts?: { readonly mode?: number; readonly parent?: string },
   ): Promise<'restored' | 'deleted' | 'enoent' | 'skipped'> {
-    // Containment first: never write, create or unlink through an ancestor
-    // directory that no longer resolves to its checkpoint-time location.
-    if (!(await parentStillMatches(path, opts?.parent))) return 'skipped'
-    if (kind === 'delete') {
-      try {
-        await deleteFile(path)
-        return 'deleted'
-      } catch (error) {
-        if (!isEnoent(error)) throw error
-        return 'enoent'
-      }
-    }
-    if (content === null) throw new Error(`restore of ${path} has no recorded content`)
-    // A `lossyText` target only occurs when CONTINUING a legacy journal: the
-    // released build had already decided to write that content, and refusing
-    // now would strand a half-restored workspace. A legacy ENTRY is never
-    // written back (see `planRestore`), which is where the choice matters.
-    await mkdir(dirname(path), { recursive: true })
-    // A read-only target cannot be written: add owner-write for the attempt
-    // and take it back afterwards (R3).
-    const current = (await stat(path).catch(() => undefined))?.mode
-    let widened = false
-    if (current !== undefined && (current & 0o200) === 0) {
-      await chmod(path, current | 0o200).catch(() => undefined)
-      widened = true
-    }
+    const parent = opts?.parent
+    if (parent === undefined || !(await parentStillMatches(path, parent))) return 'skipped'
+    const name = basename(path)
     try {
-      if (content.kind === 'blob') await copyFile(content.path, path)
-      else if (content.kind === 'text') await writeFile(path, content.bytes)
-      else await writeFile(path, Buffer.from(content.text, 'utf8'))
+      if (kind === 'delete') {
+        await withPinnedDir(parent, dir => deleteFile(join(dir, name)))
+        return 'deleted'
+      }
+      if (content === null) throw new Error(`restore of ${path} has no recorded content`)
+      // A `lossyText` target only occurs when CONTINUING a legacy journal: the
+      // released build had already decided to write that content, and refusing
+      // now would strand a half-restored workspace. A legacy ENTRY is never
+      // written back (see `planRestore`), which is where the choice matters.
+      const bytes = content.kind === 'blob'
+        ? await readFile(content.path)
+        : content.kind === 'text' ? content.bytes : Buffer.from(content.text, 'utf8')
+      await mkdir(parent, { recursive: true })
+      return await withPinnedDir(parent, dir => writeRestored(join(dir, name), bytes, opts?.mode))
     } catch (error) {
-      if (widened && current !== undefined) await chmod(path, current).catch(() => undefined)
+      if (isLocationChange(error)) return 'skipped'
+      if (kind === 'delete' && isEnoent(error)) return 'enoent'
       throw error
     }
-    // Best-effort: a filesystem that refuses chmod must never fail a restore
-    // whose bytes landed (Windows permission bits, exotic mounts, …).
-    if (opts?.mode !== undefined) await chmod(path, opts.mode).catch(() => undefined)
-    // No recorded mode (a legacy entry, or a link materialized without one):
-    // the live bits are not ours to change, so only undo the widening.
-    else if (widened && current !== undefined) await chmod(path, current).catch(() => undefined)
-    return 'restored'
   }
 
   /**
@@ -2152,7 +2305,7 @@ export class SnapshotStore {
         if (applied === 'skipped') {
           // The directory no longer resolves where the op was pinned: refuse
           // the redo and keep the journal non-terminal, with the reason.
-          action.failed = `parent directory moved or repointed: ${dirname(action.path)}`
+          action.failed = `path moved or repointed: ${action.path}`
           await this.saveJournal(journal)
           failed.push({ path: action.path, message: action.failed })
           continue
@@ -2257,7 +2410,7 @@ export class SnapshotStore {
         if (applied === 'skipped') {
           // A rollback that cannot verify the location must not claim to have
           // undone the op: leave it retryable as recovery-required.
-          journal.rollbackError = `parent directory moved or repointed: ${action.path}`
+          journal.rollbackError = `path moved or repointed: ${action.path}`
           journal.state = 'recovery-required'
           await this.saveJournal(journal)
           failed.push({ path: action.path, message: journal.rollbackError })
@@ -2909,6 +3062,11 @@ export async function reconcileTracked(
   for (const path of tracked) {
     try {
       if (await probe.isLink(path)) continue
+      // A directory that no longer resolves where this path was recorded is not
+      // this path any more: recording it would pin the new location and let a
+      // later rewind write there.
+      const pinned = await store.lastKnownParent(sessionId, path)
+      if (pinned !== undefined && !(await parentStillMatches(path, pinned))) continue
       // SIZE CAP: an over-cap state is never recorded, checked before the
       // content comparison so its bytes are not read at all. A path first seen
       // over the cap is simply never tracked, so it can never be mis-restored.

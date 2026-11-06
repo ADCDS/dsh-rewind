@@ -64,6 +64,7 @@ interface Mounted {
 const fakeFs = () => ({
   resolve: async (path: string) => ({ displayPath: path }),
   stat: async () => ({ type: 'file', size: 3, mode: 0o644 }),
+  processPathFromHostPath: (path: string) => path,
 })
 
 /** Drive one `ctx.effect` callback: a disposer-returning function or a generator. */
@@ -89,7 +90,7 @@ function collect(fn: unknown, into: Disposer[]): void {
  * @param options - the optional services the mount may reach (a real fs).
  * @returns the mount's recorded surface plus its disposer.
  */
-function mount(options: { fs?: boolean } = {}): Mounted {
+function mount(options: { fs?: boolean; hostMapping?: boolean } = {}): Mounted {
   const disposers: Disposer[] = []
   const commands = new Map<string, { name: string; description?: string; handler: (invocation: unknown) => Promise<unknown> }>()
   const handlers = new Map<string, (...args: never[]) => unknown>()
@@ -127,7 +128,7 @@ function mount(options: { fs?: boolean } = {}): Mounted {
     inject: (services: readonly string[], callback: (scoped: unknown) => void) => {
       if (services.includes('fs') && options.fs === true) {
         callback({
-          fs: fakeFs(),
+          fs: options.hostMapping === false ? { ...fakeFs(), processPathFromHostPath: () => undefined } : fakeFs(),
           // Absolute file_paths here: the base value only has to exist.
           workingDirectory: { ensure: async () => root },
           // The injected scope is a real Context: it carries `effect` for the
@@ -228,6 +229,21 @@ describe('host mount lifecycle', () => {
     // Unload between the two stages (the exact window a live disable lands in).
     await mounted.dispose()
     expect(await stagedFiles()).toEqual([])
+  })
+
+  it('captures nothing for a backend that cannot name the path on the host', async () => {
+    const mounted = mount({ fs: true, hostMapping: false })
+    apply(mounted.ctx, testConfig({ snapshotDir: snapRoot }))
+    const target = join(root, 'same-name-as-remote.txt')
+    await writeFile(target, 'host bytes', 'utf8')
+    const session = Session.create(SessionId('lifecycle-session'))
+    await mounted.toolHandlers.get('tools/execute')!(
+      { name: 'write', callId: 'call-1', arguments: { file_path: target }, agent: { id: 'agent-1', session }, signal: new AbortController().signal } as never,
+      (async () => ({ ok: true })) as never,
+    )
+
+    expect(await stagedFiles()).toEqual([])
+    await mounted.dispose()
   })
 
   it('a tool result drains its staged capture before the unload', async () => {

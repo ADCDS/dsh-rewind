@@ -32,12 +32,12 @@ import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionId, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
 import type { PostToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import type { WorkingDirectoryService } from '@deepseek-ai/dsh-working-directory'
-import { copyFile, rm, stat, unlink } from 'node:fs/promises'
+import { rm, stat, unlink } from 'node:fs/promises'
 import type {} from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { preferredLocale, translate, type HostKey, type HostLocaleId } from './locales.ts'
 import { listRewindCandidates, parseRewindTarget, planRewind, REWIND_MARKER_SOURCE, RewindError, type RewindMode, type RewindPlan } from './rewind.ts'
-import { DEFAULT_MAX_FILE_BYTES, MAX_ANCHOR_GROUPS, reconcileTracked, SnapshotStore, UnknownStoreVersionError, type ClearSessionReport, type FileImpact, type PendingBackup, type PruneStaleReport, type RestoreOutcome, type UncoveredPath } from './snapshot.ts'
+import { copyNoFollow, DEFAULT_MAX_FILE_BYTES, locationPin, MAX_ANCHOR_GROUPS, reconcileTracked, SnapshotStore, UnknownStoreVersionError, type ClearSessionReport, type FileImpact, type PendingBackup, type PruneStaleReport, type RestoreOutcome, type UncoveredPath } from './snapshot.ts'
 import {
   AUTO_SWEEP_INTERVAL_MS,
   DEFAULT_CLEANUP_CONFIG,
@@ -220,6 +220,8 @@ interface PendingCapture {
   readonly path: string
   /** Staged raw before-bytes, or null when the file does not exist (a creation). */
   readonly backup: PendingBackup | null
+  /** Location pin read before the tool ran, so the tool cannot move it first. */
+  readonly parent?: string
 }
 
 /** Drop a staged capture's bytes (a no-op when nothing was staged). */
@@ -344,6 +346,12 @@ async function captureBefore(
   const cwd = await workingDirectory.ensure(agent, exec.signal)
   const target = await resolveTarget(fs, path, cwd, exec.signal)
   if (target === undefined) return
+  // Restores run through host node:fs. A backend that cannot name this path on
+  // the host (a remote one, where displayPath may be a URI or a remote path) has
+  // nothing a host restore could safely touch, including a same-named host file.
+  if (fs.processPathFromHostPath(target.displayPath) === undefined) return
+  const parent = await locationPin(target.displayPath)
+  const pin = parent !== undefined ? { parent } : {}
   const info = await fs.stat(target, exec.signal).catch((error: unknown) => {
     // Only an affirmative "not found" answer becomes a creation. Any other
     // failure abandons the capture (the caller logs it and the tool proceeds
@@ -366,13 +374,13 @@ async function captureBefore(
   if (info !== undefined && store.isOverFileCap(info.size)) return
   const key = `${exec.agent?.id ?? 'anon'}:${exec.callId}`
   if (info === undefined) {
-    pending.set(key, { path: target.displayPath, backup: null })
+    pending.set(key, { path: target.displayPath, backup: null, ...pin })
     return
   }
   const staged = await store.stageCapture(agent.session.id, key)
   let backup: PendingBackup
   try {
-    await copyFile(target.displayPath, staged)
+    await copyNoFollow(target.displayPath, staged)
     const st = await stat(staged)
     // Permission bits are recorded best-effort next to the bytes: they belong
     // to the file's state, but they never decide whether a restore happens.
@@ -391,7 +399,7 @@ async function captureBefore(
     await rm(staged, { force: true })
     throw error
   }
-  pending.set(key, { path: target.displayPath, backup })
+  pending.set(key, { path: target.displayPath, backup, ...pin })
 }
 
 /**
@@ -437,7 +445,7 @@ async function commitEntry(
       callId: exec.callId,
       anchorSeq,
       path: capture.path,
-    }, capture.backup)
+    }, capture.backup, capture.parent !== undefined ? { parent: capture.parent } : undefined)
   } catch (error) {
     // A refused commit (a store written by a newer build, an IO failure) leaves
     // the staged bytes with no owner: the capture already left `pending` above,

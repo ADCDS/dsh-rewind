@@ -99,13 +99,24 @@ rendered transcript. The marker shape is specified in
 - **Links are refused**: planning skips a path whose last component is a
   symlink or a hard link and reports it — a symlink would redirect the write
   outside the checkpoint, and a hard link would clobber every other name of the
-  same inode. A link swapped in after planning is not re-checked.
-- **Recorded locations are re-checked**: every record written by this build
-  carries the directory location resolved at commit time; a restore re-checks
-  it before touching the path, including after a restart. A directory that no
-  longer resolves there is refused and reported; a missing parent chain is
-  recreated only inside the recorded location. Data with no recorded location
-  falls back to the link check. This matches Claude Code's checkpoint behavior.
+  same inode. The write checks again through its own open descriptors, so a
+  symlink, hard link or FIFO swapped in after planning is refused as well.
+- **Recorded locations are re-checked**: every record carries the directory
+  location resolved when the file was captured, or where a missing directory
+  would have resolved, and a boundary re-check never adopts a directory that has
+  moved. A restore re-checks the location before touching the path, including
+  after a restart. A directory that no longer resolves there is refused and
+  reported; a missing parent chain is recreated only inside the recorded
+  location. A record with no location is refused and reported.
+- **Changes go through the verified directory**: on Linux, each write and delete
+  runs through a descriptor held on the directory whose location the kernel just
+  confirmed, so swapping a path component afterwards cannot redirect it. Other
+  platforms re-check the location immediately before the change, and a swap in
+  that gap is not excluded. On a race, `mkdir` can still create empty directories
+  under a repointed ancestor before the location is verified.
+- **Host paths only**: a filesystem backend that cannot name a path on the host,
+  such as a remote one, is not captured, so a restore never acts on a same-named
+  host file.
 - **Observation sync (best-effort)**: after a restore, the plugin re-emits the
   host's `fs/observed` event for the paths it changed (absent, or present with
   the current version), so a host with the observation policy enabled does not

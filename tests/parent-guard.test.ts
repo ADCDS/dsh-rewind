@@ -75,7 +75,8 @@ describe('location pin', () => {
   })
 
   it('records no pin for a path whose parent cannot be resolved', async () => {
-    const ghost = join(root, 'does-not-exist', 'f.txt')
+    await symlink(join(root, 'missing-target'), join(root, 'dangling'), 'dir')
+    const ghost = join(root, 'dangling', 'f.txt')
     await store.recordBackup(session, { callId: 'c2', anchorSeq: 6, path: ghost }, null)
 
     const [entry] = await store.entriesAfter(session, 0)
@@ -254,9 +255,9 @@ describe('repointed ancestor directory', () => {
     expect(await readFile(live, 'utf8')).toBe('before')
   })
 
-  it('keeps an unpinned (legacy) entry working', async () => {
-    // Entries written before the pin existed have no location to verify; they
-    // keep the released final-component behavior instead of being refused.
+  it('refuses an unpinned (legacy) entry', async () => {
+    // A location that was never recorded cannot be verified, so the entry is
+    // reported instead of restored through whatever the path resolves to now.
     const live = await touch('legacy/f.txt', 'before')
     await mkdir(store.anchorDir(session, 5), { recursive: true })
     await writeFile(join(store.anchorDir(session, 5), 'legacy.before'), 'before', 'utf8')
@@ -266,8 +267,9 @@ describe('repointed ancestor directory', () => {
     await writeFile(live, 'after', 'utf8')
 
     const outcome = await store.restoreAfter(session, 5, unlink)
-    expect(outcome.restored).toEqual([live])
-    expect(await readFile(live, 'utf8')).toBe('before')
+    expect(outcome.restored).toEqual([])
+    expect(outcome.skipped).toEqual([live])
+    expect(await readFile(live, 'utf8')).toBe('after')
   })
 
   it('refuses a continue after the ancestor moved, and keeps the op open', async () => {
