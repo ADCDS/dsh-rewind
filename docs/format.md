@@ -59,7 +59,7 @@ interface CheckpointEntryJson {   // one `<base>.json`
   store: 2              // on-disk store format (absent/1 = the released v1 string format)
   callId: string        // the tool call that mutated the file
   file: string          // resolved display path (absolute)
-  parent?: string       // realpath of the file's directory at commit time (the location pin)
+  parent?: string       // canonical directory of the file when captured (the location pin)
   blob: string | null   // sibling sidecar file name; null = the file was created
   size: number          // byte length of the sidecar (0 when `blob` is null)
   mode?: number         // permission bits, applied when content is restored
@@ -81,13 +81,14 @@ Semantics:
 - **`anchorSeq` is the parent directory**, deliberately not a field of the
   entry: rewinding to message N applies every entry anchored at or after N (the
   boundary is inclusive).
-- **`parent` is the location pin**: the `realpath` of `dirname(file)` at commit
-  time. A restore refuses the path when its directory no longer resolves there.
-  Only the path's FINAL component is checked for links (`lstat().nlink > 1` or a
-  symlink; see `security-model.md`), so a repointed ancestor directory would otherwise
-  redirect the write — or the unlink of a recorded creation — outside the
-  recorded location. Absent means "no pin" and falls back to the final-component
-  check alone.
+- **`parent` is the location pin**: the `realpath` of `dirname(file)` when the
+  file was captured. When that directory does not exist, the pin is where it
+  would resolve: the `realpath` of its nearest surviving ancestor plus the missing
+  segments. A restore refuses the path when its directory no longer resolves
+  there, so a repointed ancestor cannot redirect the write or the unlink, and a
+  missing parent chain is recreated only inside the recorded location. Absent
+  means "no pin": the location cannot be verified, so the entry is reported and
+  never restored. This includes every released v1 entry.
 - **`time` is the ordering key within an anchor group**: it is monotonic per
   store instance (bumped past the previous commit), so same-millisecond
   commits stay capture-ordered and a re-read always picks the same "earliest"
@@ -180,14 +181,13 @@ versions on disk.
   A sidecar that is missing, or whose size differs from `size`, is a per-file
   failure — never a silent "the file was created".
 - **Pinned location**: every record this build writes — entry, link and journal
-  action — carries where the tracked file's directory resolved at commit time
+  action — carries where the tracked file's directory resolved when captured
   (the `parent` pin, best-effort), and a restore re-checks it before touching the
   path — the initial pass, a post-restart `continueRestore` and a
   `rollbackRestore` alike (the journal carries the pin). A directory that
   resolves elsewhere is refused and reported, so a restore can never write or
   unlink outside the recorded location; a record with no pin (released-v1 data,
-  or a commit whose parent could not be resolved) falls back to the
-  final-component link check alone. A parent chain that is GONE is still
+  or a commit whose parent could not be resolved) is refused and reported. A parent chain that is GONE is still
   recreated — the plugin restores files whose directory was deleted — but only
   while its nearest surviving ancestor resolves inside the pin. A stable
   symlinked ancestor is never refused: both sides of the comparison are
