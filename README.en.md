@@ -1,5 +1,7 @@
 # dsh-rewind
 
+> ADCDS fork of [SiriLee/dsh-rewind](https://github.com/SiriLee/dsh-rewind) v0.21.0 with restore containment fixes; see the [changelog](CHANGELOG.md).
+
 Conversation rewind for DeepSeek Harness: **rewind the conversation to any earlier user message in one click, in the same window**.<br />
 No new branch, no window switch, with optional workspace-file restore — the full Claude Code `/rewind` semantics.
 
